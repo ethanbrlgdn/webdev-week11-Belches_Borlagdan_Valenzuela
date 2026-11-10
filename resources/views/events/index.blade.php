@@ -10,7 +10,7 @@
     </style>
 </head>
 <body>
-    <h1>Upcoming events (first 50)</h1>
+    <h1>Events (first 50)</h1>
 
     <table>
         <thead>
@@ -25,7 +25,7 @@
                 <tr>
                     <td>{{ $event->title }}</td>
                     <td>{{ $event->venue->name }}</td>
-                    <td>{{ $event->participants->count() }}</td>
+                    <td>{{ $event->participants_count }}</td>
                 </tr>
             @endforeach
         </tbody>

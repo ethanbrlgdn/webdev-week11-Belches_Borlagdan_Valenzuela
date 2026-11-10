@@ -11,7 +11,9 @@ class EventController extends Controller
     {
         DB::enableQueryLog();
 
-        $events = Event::orderBy('id')
+        $events = Event::with('venue')
+            ->withCount('participants')
+            ->orderBy('id')
             ->limit(50)
             ->get();
 
