@@ -1,88 +1,53 @@
-# Campus Events (Week 10: Eloquent Relationships and Foreign Keys in PostgreSQL)
+   # Week 11 - Optimized & Advanced Queries (Campus Events at Scale)
 
-A small Laravel + PostgreSQL data layer for a Campus Events system. Venues host events, participants register for events, and notes can be attached to either an event or a venue.
+   Group: Belches, Borlagdan, Valenzuela
 
-**Authors:** Belches, Borlagdan, Valenzuela
+   Setup: `composer install`, copy `.env.example` to `.env` and set the database to `webdev_week11`, then run `php artisan migrate:fresh --seed`.
 
-## Tech stack
+   ## Query counts (Step 4)
 
-- Laravel (PHP 8.3)
-- PostgreSQL
-- Blade (report page)
+   | Version of /events | Queries sent | What was sent |
+   |---|---|---|
+   | Naive (lazy loading) | 101 | 1 for the events, 50 for each event's venue, 50 for each event's participant count |
+   | Fixed (eager loading + withCount) | 2 | 1 for the events with the participant count as a subquery, 1 for all the venues |
 
-## Setup
+   The naive page sends one extra query for every row, because each time the page reads an event's venue or participant count, Laravel goes back to the database. The fixed page asks for the venues and the participant counts together with the events, so the number of queries stays at 2 no matter how many events are listed.
 
-1. Clone the repository and install dependencies:
-   ```bash
-   composer install
-   ```
-2. Copy the environment file and generate an app key:
-   ```bash
-   cp .env.example .env
-   php artisan key:generate
-   ```
-3. Create a PostgreSQL database (for example `webdev_week10`) and set these values in `.env`:
-   ```
-   DB_CONNECTION=pgsql
-   DB_HOST=127.0.0.1
-   DB_PORT=5432
-   DB_DATABASE=webdev_week10
-   DB_USERNAME=your_username
-   DB_PASSWORD=your_password
-   ```
-4. Build the schema and seed the sample data:
-   ```bash
-   php artisan migrate:fresh --seed
-   ```
-5. Start the app and open the report page:
-   ```bash
-   php artisan serve
-   ```
-   Then visit `http://127.0.0.1:8000/report` (replace `/report` with the route defined in `routes/web.php` if yours differs).
+   ## Local scopes on Event
 
-## Tables
+   | Scope | What it does |
+   |---|---|
+   | `upcoming()` | Keeps only events that start now or later. |
+   | `atVenue($venueId)` | Keeps only events at the given venue. |
+   | `soonestFirst()` | Orders events by start time, earliest first. |
 
-| Table | Primary key | Foreign keys |
-|---|---|---|
-| `venues` | `id` | none |
-| `events` | `id` | `venue_id` → `venues.id` |
-| `participants` | `id` | none |
-| `event_participant` (pivot) | composite (`event_id`, `participant_id`) | `event_id` → `events.id`, `participant_id` → `participants.id` |
-| `notes` | `id` | none enforced (`notable_type` + `notable_id` are a polymorphic pair) |
+   Chained example (used on `/events/filter`): `Event::upcoming()->atVenue($venue)->soonestFirst()`.
 
-The pivot table also stores a `status` column (`registered` or `waitlisted`).
+   ## Query plans (Step 7)
 
-## Relationships
+   All times come from `EXPLAIN (ANALYZE)` on 20,000 events, using the rare values from the seeder (`telescope` appears in 80 events, `dress_code = costume` in 100).
 
-| Link | Type | Model / table holding the foreign key | Relationship methods | ON DELETE | Reason |
-|---|---|---|---|---|---|
-| Venue and Event | One-to-many | `Event` (`events.venue_id`) | `Venue::events()` (hasMany), `Event::venue()` (belongsTo) | RESTRICT | A venue that still has events must not be deletable. |
-| Event and Participant | Many-to-many with `status` | `event_participant` pivot (`event_id`, `participant_id`) | `Event::participants()` (belongsToMany), `Participant::events()` (belongsToMany) | CASCADE | A registration has no meaning once its event or participant is gone, so it is removed automatically. |
-| Note and Event / Venue | Polymorphic one-to-many | `Note` (`notes.notable_type` + `notes.notable_id`) | `Note::notable()` (morphTo), `Event::notes()` (morphMany), `Venue::notes()` (morphMany) | None (app-level only) | A foreign key can only point to one table, so PostgreSQL cannot enforce a link that points at either `events` or `venues`. |
+   | Query | Index that exists | Plan type | Execution time |
+   |---|---|---|---|
+   | A: full-text search for "telescope" | None | Seq Scan | 558.044 ms |
+   | A: full-text search for "telescope" | GIN on `to_tsvector('english', description)` | Bitmap Index Scan + Bitmap Heap Scan | 0.529 ms |
+   | B: JSONB containment `details @> '{"dress_code": "costume"}'` | None | Seq Scan | 6.377 ms |
+   | B: JSONB containment `details @> '{"dress_code": "costume"}'` | GIN on `details` | Bitmap Index Scan + Bitmap Heap Scan | 1.036 ms |
+   | C: JSONB arrow form `details->>'dress_code' = 'costume'` | None | Seq Scan | 4.721 ms |
+   | C: JSONB arrow form `details->>'dress_code' = 'costume'` | GIN on `details` (exists, **not used**) | Seq Scan | 8.413 ms |
+   | C: JSONB arrow form `details->>'dress_code' = 'costume'` | B-tree on `(details->>'dress_code')` | Bitmap Index Scan + Bitmap Heap Scan | 0.201 ms |
+   | D: upcoming events at venue 1 ordered by `starts_at` | None | Seq Scan + Sort | 6.136 ms |
+   | D: upcoming events at venue 1 ordered by `starts_at` | B-tree on `(venue_id, starts_at)` | Bitmap Index Scan + Bitmap Heap Scan + Sort | 3.878 ms |
 
-## What PostgreSQL enforces and what it does not
+   **Why the GIN index is not used for Query C:** a default GIN index on a jsonb column only supports operators such as `@>` and `?`. The arrow form uses `->>`, which first extracts the value as text, so PostgreSQL cannot use the GIN index and falls back to a Seq Scan. An index on the extracted expression, `(details->>'dress_code')`, is the one that matches this query.
 
-**Enforced by the database:**
-- An event cannot be inserted with a venue that does not exist.
-- A venue that still has events cannot be deleted (`RESTRICT`).
-- The same participant cannot register for the same event twice (composite primary key on the pivot).
-- Deleting an event or a participant removes its registrations (`CASCADE`).
+   **Notes:** each time comes from a single run, so small differences (for example the 4.721 ms against 8.413 ms Seq Scans for Query C) are caching noise and not a real difference. Query D returns about 2,000 rows, roughly 10% of the table, so its index helps less than the indexes on the selective queries A, B and C.
 
-**Only our code can enforce:**
-- That a note's `notable_id` points to a real row in the table named by `notable_type`. PostgreSQL accepts an orphan note because the polymorphic columns have no foreign key constraint.
+   ## Why the indexes are in migrations (Step 8)
 
-## Report page
+Every index is created inside a migration so that `php artisan migrate:fresh --seed` rebuilds the whole database, indexes included. An index created by hand in psql disappears as soon as the tables are dropped. Laravel's schema builder cannot create a GIN index or an index on an expression such as `details->>'dress_code'`, so those use `DB::statement()` raw SQL inside the migration, with `IF NOT EXISTS` so running it twice does not fail.
 
-The report page uses Eloquent relationships (`withCount`, `whereHas`, `with`, `morphTo`) rather than hand-written JOINs, and shows:
+## What goes in JSONB and what goes in a column (Step 9)
 
-1. Every venue with the number of events it hosts
-2. All events at one chosen venue
-3. All participants of one chosen event, with each registration status
-4. All events one chosen participant has joined
-5. All events that have at least one waitlisted participant
-6. All notes of one chosen event and of one chosen venue
-7. For one chosen note, the name and kind of the thing it belongs to
-
-## Seed data
-
-`php artisan migrate:fresh --seed` creates at least 3 venues, 6 events, 8 participants, 12 registrations (both statuses used), and 6 notes (at least two on events and two on venues).
+- **In the JSONB column (`details`): `dress_code`.** Only some events need a dress code, and it is an optional detail that can change shape later (for example new keys such as `tags`). JSONB lets us add or skip it per event without a migration or a column full of NULLs.
+- **In a normal column: `starts_at`.** Every event has a start time, and we filter and sort by it all the time. A real `timestamp` column gives us type checking, a NOT NULL guarantee, and a fast composite B-tree index with `venue_id`, which a value buried in JSON could not offer as simply.
